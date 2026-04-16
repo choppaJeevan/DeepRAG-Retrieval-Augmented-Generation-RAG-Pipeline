@@ -30,7 +30,7 @@ GENERATION_MODEL = "deepseek-r1:8b"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # Retrieval settings
-SEARCH_TOP_K = int(input("How many chunks should I retreive?"))         # Weaviate near-vector retrieval count
+SEARCH_TOP_K = 30              # Default; overridden in main() via input
 RERANK_TOP_N = 5           # Keep top N after re-ranking
 MAX_CHUNK_CHARS = 1500     # Truncate chunks before sending to LLM
 
@@ -82,7 +82,6 @@ def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
         num_workers=4,        # Increase parallelism for large docs
         verbose=True,
         language="en",
-        fast_mode=True,
     )
 
     print(f"Parsing: {pdf_path}")
@@ -90,14 +89,16 @@ def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
     print(f"Parsed {len(documents)} document sections.")
 
     # Convert LlamaIndex → LangChain documents with metadata
+    # NOTE: LlamaParse returns empty metadata (no page_label).
+    # Since it returns ~1 section per page, we use the index as page number.
     lc_docs = []
-    for doc in documents:
-        page_num = doc.metadata.get("page_label", "Unknown")
+    for idx, doc in enumerate(documents):
+        page_num = doc.metadata.get("page_label", str(idx + 1))
         lc_docs.append(
             LC_Document(
                 page_content=doc.text,
                 metadata={
-                    "source": doc.metadata.get("file_name", "Unknown"),
+                    "source": doc.metadata.get("file_name", os.path.basename(pdf_path)),
                     "page_number": page_num,
                 },
             )
@@ -389,6 +390,9 @@ def generate_answer(prompt: str) -> str:
 
 # MAIN PIPELINE
 def main():
+    global SEARCH_TOP_K
+    SEARCH_TOP_K = int(input("How many chunks to retrieve? [default=30]: ") or 30)
+
     timings = {}
     total_start = time.perf_counter()
 
