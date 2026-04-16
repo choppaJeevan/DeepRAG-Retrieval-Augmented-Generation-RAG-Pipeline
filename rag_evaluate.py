@@ -28,7 +28,7 @@ from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
 
 def main():
     print("=" * 60)
-    print("🚀 INIT: Ollama Judge (Mistral) & Embeddings (Nomic)")
+    print("INIT: Ollama Judge (Mistral) & Embeddings (Nomic)")
     print("=" * 60)
     
     # 1. Initialize OpenAI client pointing to local Ollama
@@ -42,16 +42,16 @@ def main():
     evaluator_embeddings = RagasOpenAIEmbeddings(model="nomic-embed-text", client=client)
     
     print("\n" + "=" * 60)
-    print("🔄 SYNC: Validating Vector Database State")
+    print("SYNC: Validating Vector Database State")
     print("=" * 60)
     processed_chunks = load_or_process(FILE_PATH)
     upload_to_weaviate(processed_chunks)
     
     print("\n" + "=" * 60)
-    print("📂 LOAD: Evaluation Dataset")
+    print("LOAD: Evaluation Dataset")
     print("=" * 60)
     if not os.path.exists("eval_testset.json"):
-        print("❌ Error: eval_testset.json not found! Please ensure it is created.")
+        print("Error: eval_testset.json not found! Please ensure it is created.")
         return
         
     with open("eval_testset.json", "r") as f:
@@ -61,7 +61,7 @@ def main():
     samples = []
     
     print("\n" + "=" * 60)
-    print("⚡ EXEC: Running RAG Pipeline over Testset")
+    print("EXEC: Running RAG Pipeline over Testset")
     print("=" * 60)
     
     for idx, item in enumerate(tqdm(testset)):
@@ -93,7 +93,7 @@ def main():
     dataset = EvaluationDataset(samples=samples)
     
     print("\n" + "=" * 60)
-    print("⚖️ EVAL: Executing RAGAS Metrics")
+    print("EVAL: Executing RAGAS Metrics")
     print("=" * 60)
     
     metrics = [
@@ -111,7 +111,7 @@ def main():
         )
         
         print("\n" + "=" * 60)
-        print("✅ RESULTS: Aggregated Scores")
+        print("RESULTS: Aggregated Scores")
         print("=" * 60)
         print(results)
         
@@ -119,10 +119,10 @@ def main():
         df = results.to_pandas()
         export_path = "eval_results.json"
         df.to_json(export_path, orient="records", indent=4)
-        print(f"\n💾 Detailed results saved to {export_path}")
+        print(f"\nDetailed results saved to {export_path}")
         
     except Exception as e:
-        print(f"\n❌ Evaluation Failure: {e}")
+        print(f"\nEvaluation Failure: {e}")
 
 if __name__ == "__main__":
     main()
