@@ -50,11 +50,14 @@ def main():
     print("\n" + "=" * 60)
     print("LOAD: Evaluation Dataset")
     print("=" * 60)
-    if not os.path.exists("eval_testset.json"):
-        print("Error: eval_testset.json not found! Please ensure it is created.")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    testset_path = os.path.join(script_dir, "eval_testset.json")
+    
+    if not os.path.exists(testset_path):
+        print(f"Error: {testset_path} not found! Please ensure it is created.")
         return
         
-    with open("eval_testset.json", "r") as f:
+    with open(testset_path, "r") as f:
         testset = json.load(f)
     print(f"Loaded {len(testset)} test questions.")
         
@@ -117,7 +120,7 @@ def main():
         
         # Save to JSON
         df = results.to_pandas()
-        export_path = "eval_results.json"
+        export_path = os.path.join(script_dir, "eval_results.json")
         df.to_json(export_path, orient="records", indent=4)
         print(f"\nDetailed results saved to {export_path}")
         
