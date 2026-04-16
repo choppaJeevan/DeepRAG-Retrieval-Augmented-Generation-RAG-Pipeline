@@ -1,3 +1,16 @@
+import os
+import re
+import time
+import json
+import hashlib
+import weaviate
+import numpy as np
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=ResourceWarning)
+
+from llama_parse import LlamaParse
+from weaviate.classes.config import Configure, Property, DataType
 from langchain_core.documents import Document as LC_Document
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
@@ -5,9 +18,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import CrossEncoder
 
 
+from dotenv import load_dotenv
 load_dotenv()
 
-FILE_PATH = "./file_survey_paper.pdf"
+FILE_PATH = "./NLP_project/file_survey_paper.pdf"
 CACHE_DIR = "./rag_cache"
 COLLECTION_NAME = "LlamaParse_MRL_nomic"
 TARGET_DIM = 256
@@ -16,7 +30,7 @@ GENERATION_MODEL = "deepseek-r1:8b"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # Retrieval settings
-SEARCH_TOP_K = 20          # Weaviate near-vector retrieval count
+SEARCH_TOP_K = int(input("How many chunks should I retreive?"))         # Weaviate near-vector retrieval count
 RERANK_TOP_N = 5           # Keep top N after re-ranking
 MAX_CHUNK_CHARS = 1500     # Truncate chunks before sending to LLM
 
@@ -26,20 +40,19 @@ LLM_NUM_PREDICT = 1024     # Max output tokens
 LLM_TEMPERATURE = 0.1      # Low = less wandering = faster
 
 
-# ──────────────────────────────────────────────────────────────
+
 # UTILITIES
-# ──────────────────────────────────────────────────────────────
 class Timer:
     """Simple context-manager timer for profiling each step."""
     def __init__(self, label: str):
         self.label = label
     def __enter__(self):
         self.start = time.perf_counter()
-        print(f"\n⏱  [{self.label}] Starting...")
+        print(f"\n  [{self.label}] Starting...")
         return self
     def __exit__(self, *args):
         self.elapsed = time.perf_counter() - self.start
-        print(f"✅ [{self.label}] Done in {self.elapsed:.1f}s")
+        print(f" [{self.label}] Done in {self.elapsed:.1f}s")
 
 
 def file_hash(path: str) -> str:
@@ -58,9 +71,8 @@ def get_cache_path(pdf_path: str) -> str:
     return os.path.join(CACHE_DIR, f"{base}_cache.json")
 
 
-# ──────────────────────────────────────────────────────────────
+
 # STEP 1: PARSE + CHUNK + EMBED (with caching)
-# ──────────────────────────────────────────────────────────────
 def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
     """Parse PDF with LlamaParse → pre-split → semantic chunk."""
     api_key = os.getenv("LLAMA_CLOUD_API_KEY")
@@ -70,6 +82,7 @@ def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
         num_workers=4,        # Increase parallelism for large docs
         verbose=True,
         language="en",
+        fast_mode=True,
     )
 
     print(f"Parsing: {pdf_path}")
@@ -160,10 +173,10 @@ def load_or_process(pdf_path: str) -> list[dict]:
 
         if cache_data.get("file_hash") == current_hash:
             chunks = cache_data["chunks"]
-            print(f"✅ Cache hit! Loaded {len(chunks)} pre-computed chunks.")
+            print(f"Cache hit! Loaded {len(chunks)} pre-computed chunks.")
             return chunks
         else:
-            print("⚠️  PDF changed — re-processing...")
+            print("PDF changed — re-processing...")
 
     # Cache miss: full pipeline
     with Timer("Parse + Chunk"):
@@ -182,14 +195,11 @@ def load_or_process(pdf_path: str) -> list[dict]:
     }
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(cache_data, f, ensure_ascii=False)
-    print(f"💾 Cached {len(processed_chunks)} chunks to {cache_path}")
+    print(f"Cached {len(processed_chunks)} chunks to {cache_path}")
 
     return processed_chunks
 
-
-# ──────────────────────────────────────────────────────────────
 # STEP 2: WEAVIATE UPLOAD (using pre-computed vectors)
-# ──────────────────────────────────────────────────────────────
 def upload_to_weaviate(processed_chunks: list[dict]):
     """Upload chunks with pre-computed MRL vectors. No re-embedding!"""
     client = weaviate.connect_to_local()
@@ -229,15 +239,13 @@ def upload_to_weaviate(processed_chunks: list[dict]):
                     vector=item["vector"],
                 )
 
-        print(f"✅ Uploaded {len(processed_chunks)} chunks to Weaviate ({COLLECTION_NAME}).")
+        print(f"Uploaded {len(processed_chunks)} chunks to Weaviate ({COLLECTION_NAME}).")
 
     finally:
         client.close()
 
 
-# ──────────────────────────────────────────────────────────────
 # STEP 3: QUERY EMBEDDING
-# ──────────────────────────────────────────────────────────────
 def embed_query(query_text: str) -> list[float]:
     """Embed a user query, apply MRL slicing + normalization."""
     embed_model = OllamaEmbeddings(model=EMBED_MODEL_NAME)
@@ -252,9 +260,7 @@ def embed_query(query_text: str) -> list[float]:
     return sliced.tolist()
 
 
-# ──────────────────────────────────────────────────────────────
-# STEP 4: WEAVIATE VECTOR SEARCH (replaces FAISS)
-# ──────────────────────────────────────────────────────────────
+# STEP 4: WEAVIATE VECTOR SEARCH
 def weaviate_search(query_vec: list[float], top_k: int = SEARCH_TOP_K) -> list[dict]:
     """
     Search Weaviate using near_vector with pre-computed MRL vectors.
@@ -279,16 +285,14 @@ def weaviate_search(query_vec: list[float], top_k: int = SEARCH_TOP_K) -> list[d
                 "source": obj.properties.get("source", "Unknown"),
             })
 
-        print(f"🔍 Weaviate returned {len(results)} results.")
+        print(f"Weaviate returned {len(results)} results.")
         return results
 
     finally:
         client.close()
 
 
-# ──────────────────────────────────────────────────────────────
 # STEP 5: CROSS-ENCODER RE-RANKING (no LLM distillation!)
-# ──────────────────────────────────────────────────────────────
 def rerank_chunks(query: str, chunks: list[dict], top_n: int = RERANK_TOP_N) -> list[dict]:
     """
     Re-rank retrieved chunks using a cross-encoder.
@@ -309,16 +313,14 @@ def rerank_chunks(query: str, chunks: list[dict], top_n: int = RERANK_TOP_N) -> 
 
     ranked = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
 
-    print(f"📊 Re-ranked {len(chunks)} → keeping top {top_n}")
+    print(f"Re-ranked {len(chunks)} → keeping top {top_n}")
     for i, c in enumerate(ranked[:top_n]):
         print(f"   Rank {i+1}: Page {c['page']} | Score: {c['rerank_score']:.4f}")
 
     return ranked[:top_n]
 
 
-# ──────────────────────────────────────────────────────────────
 # STEP 6: PROMPT SYNTHESIS
-# ──────────────────────────────────────────────────────────────
 def build_prompt(query: str, top_chunks: list[dict]) -> str:
     """
     Build a grounded prompt with truncated context.
@@ -329,7 +331,14 @@ def build_prompt(query: str, top_chunks: list[dict]) -> str:
         "Use ONLY the provided context to answer the question.\n"
         "If the answer is not in the context, say you don't know.\n"
         "For every fact, cite the page number as [Page X].\n"
-        "Be concise and direct."
+        "Be concise and direct.\n\n"
+        "CONSTRAINTS:\n"
+        "- DO NOT use any outside knowledge or training data. Only use the CONTEXT below.\n"
+        "- DO NOT speculate, assume, or infer beyond what is explicitly stated.\n"
+        "- DO NOT repeat the question or paraphrase it back.\n"
+        "- DO NOT add disclaimers like 'based on the context provided'.\n"
+        "- DO NOT produce long chain-of-thought reasoning. Give the answer directly.\n"
+        "- If multiple pages support a fact, cite all of them."
     )
 
     context_block = ""
@@ -351,9 +360,8 @@ GROUNDED ANSWER:"""
     return prompt
 
 
-# ──────────────────────────────────────────────────────────────
+
 # STEP 7: LLM GENERATION
-# ──────────────────────────────────────────────────────────────
 def generate_answer(prompt: str) -> str:
     """Generate a grounded answer using DeepSeek-R1:8b with capped parameters."""
     llm = OllamaLLM(
@@ -363,14 +371,23 @@ def generate_answer(prompt: str) -> str:
         temperature=LLM_TEMPERATURE,
     )
 
-    print(f"🤖 {GENERATION_MODEL} is generating...")
-    response = llm.invoke(prompt)
-    return response
+    print(f"{GENERATION_MODEL} is generating...")
+    raw_response = llm.invoke(prompt)
+
+    # DeepSeek-R1 wraps reasoning in <think>...</think> tags.
+    # Strip them to get only the visible answer.
+    answer = re.sub(r"<think>.*?</think>", "", raw_response, flags=re.DOTALL).strip()
+
+    if not answer:
+        # If stripping left nothing, the model only produced thinking — return raw
+        print("[WARNING] Model produced only <think> content. Returning raw response.")
+        return raw_response
+
+    return answer
 
 
-# ──────────────────────────────────────────────────────────────
+
 # MAIN PIPELINE
-# ──────────────────────────────────────────────────────────────
 def main():
     timings = {}
     total_start = time.perf_counter()
@@ -386,7 +403,7 @@ def main():
     timings["2. Weaviate Upload"] = t.elapsed
 
     # ── Step 3: User Query + Embedding ──
-    query_text = input("\n📝 Enter your question: ")
+    query_text = input("\nEnter your question: ")
 
     with Timer("Query Embedding") as t:
         query_vector = embed_query(query_text)
@@ -416,13 +433,13 @@ def main():
     total_elapsed = time.perf_counter() - total_start
 
     print("\n" + "=" * 60)
-    print(FINAL RESPONSE:")
+    print("FINAL RESPONSE:")
     print("=" * 60)
     print(answer)
     print("=" * 60)
 
     # Performance summary
-    print("\n⏱  PERFORMANCE SUMMARY:")
+    print("\n PERFORMANCE SUMMARY:")
     print("-" * 40)
     for step, elapsed in timings.items():
         bar = "█" * int(elapsed / total_elapsed * 30)
