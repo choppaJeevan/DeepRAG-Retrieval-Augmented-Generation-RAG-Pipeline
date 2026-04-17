@@ -2,8 +2,6 @@ import os
 import re
 import time
 import json
-import random
-import difflib
 import hashlib
 import weaviate
 import numpy as np
@@ -32,22 +30,13 @@ GENERATION_MODEL = "deepseek-r1:8b"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # Retrieval settings
-SEARCH_TOP_K = 30              # Default; overridden in main() via input
-RERANK_TOP_N = 5           # Keep top N after re-ranking
-MAX_CHUNK_CHARS = 1500     # Truncate chunks before sending to LLM
+SEARCH_TOP_K = 20              # Default; overridden in main() via input
+RERANK_TOP_N = 3               # Keep only top 3 to prevent context explosion WITHOUT truncating
 
 # Generation settings
 LLM_NUM_CTX = 4096         # Context window size
 LLM_NUM_PREDICT = 1024     # Max output tokens
-LLM_TEMPERATURE = 0.1      # Low = less wandering = faster
-
-# Evaluation settings
-EVAL_DATASET_SIZE = 20
-EVAL_RANDOM_SEED = 42
-EVAL_MAX_FAILURE_EXAMPLES = 5
-EVAL_DATASET_PATH = os.path.join(CACHE_DIR, "evaluation_dataset.json")
-EVAL_RESULTS_PATH = os.path.join(CACHE_DIR, "evaluation_results.json")
-
+LLM_TEMPERATURE = 0.0      # Zero temperature to force deterministic, faithful extraction
 
 
 # UTILITIES
@@ -78,69 +67,6 @@ def get_cache_path(pdf_path: str) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
     base = os.path.splitext(os.path.basename(pdf_path))[0]
     return os.path.join(CACHE_DIR, f"{base}_cache.json")
-
-
-def tokenize(text: str) -> list[str]:
-    """Normalize and tokenize text for lightweight lexical metrics."""
-    return re.findall(r"\b\w+\b", text.lower())
-
-
-def token_f1(prediction: str, reference: str) -> float:
-    """Compute token-level F1 score."""
-    pred_tokens = tokenize(prediction)
-    ref_tokens = tokenize(reference)
-    if not pred_tokens or not ref_tokens:
-        return 0.0
-    pred_counts = {}
-    for tok in pred_tokens:
-        pred_counts[tok] = pred_counts.get(tok, 0) + 1
-    ref_counts = {}
-    for tok in ref_tokens:
-        ref_counts[tok] = ref_counts.get(tok, 0) + 1
-    overlap = 0
-    for tok, cnt in pred_counts.items():
-        overlap += min(cnt, ref_counts.get(tok, 0))
-    if overlap == 0:
-        return 0.0
-    precision = overlap / len(pred_tokens)
-    recall = overlap / len(ref_tokens)
-    return 2 * precision * recall / (precision + recall)
-
-
-def bigrams(tokens: list[str]) -> set[tuple[str, str]]:
-    return set(zip(tokens, tokens[1:])) if len(tokens) > 1 else set()
-
-
-def grounded_bigram_recall(answer: str, context: str) -> float:
-    """Proxy groundedness: answer bigrams also present in retrieved context."""
-    answer_bigrams = bigrams(tokenize(answer))
-    if not answer_bigrams:
-        return 0.0
-    context_bigrams = bigrams(tokenize(context))
-    overlap = len(answer_bigrams.intersection(context_bigrams))
-    return overlap / len(answer_bigrams)
-
-
-def extract_json_object(text: str) -> dict | None:
-    """Attempt to parse the first JSON object in LLM output."""
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        pass
-
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        return None
-    try:
-        parsed = json.loads(match.group(0))
-        return parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        return None
-
 
 
 # STEP 1: PARSE + CHUNK + EMBED (with caching)
@@ -177,8 +103,8 @@ def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
 
     # Pre-split to stay within embedding model token limits
     pre_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=4000,
-        chunk_overlap=400,
+        chunk_size=1500,
+        chunk_overlap=150,
     )
     pre_split_docs = pre_splitter.split_documents(lc_docs)
     print(f"Pre-split into {len(pre_split_docs)} chunks.")
@@ -394,29 +320,22 @@ def rerank_chunks(query: str, chunks: list[dict], top_n: int = RERANK_TOP_N) -> 
 
 # STEP 6: PROMPT SYNTHESIS
 def build_prompt(query: str, top_chunks: list[dict]) -> str:
-    """
-    Build a grounded prompt with truncated context.
-    MAX_CHUNK_CHARS prevents context explosion for large documents.
-    """
     system_rules = (
-        "You are a professional research assistant. "
-        "Use ONLY the provided context to answer the question.\n"
-        "If the answer is not in the context, say you don't know.\n"
-        "For every fact, cite the page number as [Page X].\n"
-        "Be concise and direct.\n\n"
+        "You are an exact, fact-based research assistant.\n"
+        "Your CORE MISSION is to answer using ONLY the explicit facts from the context below.\n"
+        "If the context does not explicitly state the answer, you MUST say 'I cannot answer this based on the provided text'.\n"
         "CONSTRAINTS:\n"
-        "- DO NOT use any outside knowledge or training data. Only use the CONTEXT below.\n"
-        "- DO NOT speculate, assume, or infer beyond what is explicitly stated.\n"
-        "- DO NOT repeat the question or paraphrase it back.\n"
-        "- DO NOT add disclaimers like 'based on the context provided'.\n"
-        "- DO NOT produce long chain-of-thought reasoning. Give the answer directly.\n"
-        "- If multiple pages support a fact, cite all of them."
+        "- NO HALLUCINATION: Do not inject outside knowledge or guess.\n"
+        "- NO RAMBLING: Do not write paragraphs if a single sentence answers the question.\n"
+        "- CITE RELIABLY: Always append [Page X] to the end of a sentence if you used a fact from that page.\n"
+        "- DO NOT paraphrase back the question.\n"
+        "- DO NOT write disclaimers."
     )
 
     context_block = ""
     for i, chunk in enumerate(top_chunks):
-        # Truncate each chunk to prevent context explosion
-        content = chunk["content"][:MAX_CHUNK_CHARS]
+        # We now pass the entire unbroken chunk safely since we reduced top_n to 3
+        content = chunk["content"]
         context_block += f"\n--- CHUNK {i+1} (PAGE {chunk['page']}) ---\n{content}\n"
 
     prompt = f"""{system_rules}
@@ -458,311 +377,11 @@ def generate_answer(prompt: str) -> str:
     return answer
 
 
-def build_synthetic_qa_prompt(chunk_text: str, page_number: str) -> str:
-    """Prompt template for generating synthetic grounded Q/A."""
-    return f"""You are generating evaluation data for a RAG system.
-Create one grounded question-answer pair from the context below.
-
-Rules:
-- The question must be answerable from this context alone.
-- The answer must be concise (1-3 sentences), factual, and directly grounded.
-- Include page citation in answer exactly as [Page {page_number}].
-- Return ONLY valid JSON with keys: question, answer.
-
-CONTEXT:
-{chunk_text}
-"""
-
-
-def generate_synthetic_sample(chunk: dict, chunk_id: int) -> dict | None:
-    """Generate one synthetic Q/A sample from a chunk."""
-    page = str(chunk["metadata"].get("page_number", "Unknown"))
-    content = chunk["content"][:MAX_CHUNK_CHARS]
-    prompt = build_synthetic_qa_prompt(content, page)
-    raw = generate_answer(prompt)
-    parsed = extract_json_object(raw)
-    if not parsed:
-        return None
-
-    question = str(parsed.get("question", "")).strip()
-    answer = str(parsed.get("answer", "")).strip()
-    if len(question) < 12 or len(answer) < 20:
-        return None
-    if "[Page" not in answer:
-        return None
-
-    return {
-        "id": f"synth_{chunk_id}",
-        "question": question,
-        "reference_answer": answer,
-        "source_page": page,
-        "source_chunk_id": chunk_id,
-    }
-
-
-def is_near_duplicate(question: str, existing_questions: list[str], threshold: float = 0.9) -> bool:
-    """Simple similarity check to avoid duplicate synthetic questions."""
-    q_norm = " ".join(tokenize(question))
-    for existing in existing_questions:
-        e_norm = " ".join(tokenize(existing))
-        if not q_norm or not e_norm:
-            continue
-        ratio = difflib.SequenceMatcher(None, q_norm, e_norm).ratio()
-        if ratio >= threshold:
-            return True
-    return False
-
-
-def save_json(path: str, payload: dict):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-def load_cached_eval_dataset(expected_hash: str, requested_size: int) -> list[dict] | None:
-    if not os.path.exists(EVAL_DATASET_PATH):
-        return None
-    with open(EVAL_DATASET_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if data.get("file_hash") != expected_hash:
-        return None
-    samples = data.get("samples", [])
-    if len(samples) < requested_size:
-        return None
-    return samples[:requested_size]
-
-
-def build_synthetic_dataset(processed_chunks: list[dict], file_hash_value: str, dataset_size: int = EVAL_DATASET_SIZE) -> list[dict]:
-    """Generate or load cached synthetic Q/A dataset."""
-    cached_samples = load_cached_eval_dataset(file_hash_value, dataset_size)
-    if cached_samples is not None:
-        print(f"Loaded cached synthetic eval dataset with {len(cached_samples)} samples.")
-        return cached_samples
-
-    random.seed(EVAL_RANDOM_SEED)
-    sampled_indices = list(range(len(processed_chunks)))
-    random.shuffle(sampled_indices)
-
-    samples = []
-    existing_questions = []
-    max_attempts = min(len(sampled_indices), dataset_size * 3)
-    for idx in sampled_indices[:max_attempts]:
-        sample = generate_synthetic_sample(processed_chunks[idx], idx)
-        if not sample:
-            continue
-        if is_near_duplicate(sample["question"], existing_questions):
-            continue
-        samples.append(sample)
-        existing_questions.append(sample["question"])
-        print(f"Synthetic sample {len(samples)}/{dataset_size} generated.")
-        if len(samples) >= dataset_size:
-            break
-
-    if not samples:
-        raise RuntimeError("Failed to generate any synthetic evaluation samples.")
-
-    dataset_payload = {
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "file_hash": file_hash_value,
-        "file_path": FILE_PATH,
-        "dataset_size": len(samples),
-        "samples": samples,
-    }
-    save_json(EVAL_DATASET_PATH, dataset_payload)
-    print(f"Saved synthetic evaluation dataset to {EVAL_DATASET_PATH}")
-    return samples
-
-
-def evaluate_one_sample(sample: dict, top_k: int) -> dict:
-    """Run full retrieval + generation pipeline for one evaluation sample."""
-    step_times = {}
-
-    with Timer("Eval: Query Embedding") as t:
-        query_vector = embed_query(sample["question"])
-    step_times["query_embed_s"] = t.elapsed
-
-    with Timer("Eval: Retrieval") as t:
-        retrieved_chunks = weaviate_search(query_vector, top_k=top_k)
-    step_times["retrieval_s"] = t.elapsed
-
-    with Timer("Eval: Re-ranking") as t:
-        top_chunks = rerank_chunks(sample["question"], retrieved_chunks, top_n=RERANK_TOP_N)
-    step_times["rerank_s"] = t.elapsed
-
-    with Timer("Eval: Prompt Build") as t:
-        final_prompt = build_prompt(sample["question"], top_chunks)
-    step_times["prompt_s"] = t.elapsed
-
-    with Timer("Eval: Answer Generation") as t:
-        answer = generate_answer(final_prompt)
-    step_times["generation_s"] = t.elapsed
-
-    retrieved_pages_before = [str(c.get("page", "Unknown")) for c in retrieved_chunks]
-    retrieved_pages_after = [str(c.get("page", "Unknown")) for c in top_chunks]
-    source_page = str(sample["source_page"])
-
-    rr = 0.0
-    if source_page in retrieved_pages_before:
-        rank = retrieved_pages_before.index(source_page) + 1
-        rr = 1.0 / rank
-
-    combined_context = "\n".join(chunk["content"] for chunk in top_chunks)
-    metrics = {
-        "hit_at_k_before": int(source_page in retrieved_pages_before),
-        "hit_at_n_after": int(source_page in retrieved_pages_after),
-        "reciprocal_rank": rr,
-        "token_f1": token_f1(answer, sample["reference_answer"]),
-        "citation_ok": int(bool(re.search(r"\[Page\s+\d+\]", answer))),
-        "grounded_bigram_recall": grounded_bigram_recall(answer, combined_context),
-    }
-
-    return {
-        "sample_id": sample["id"],
-        "question": sample["question"],
-        "reference_answer": sample["reference_answer"],
-        "source_page": source_page,
-        "retrieved_pages_before": retrieved_pages_before,
-        "retrieved_pages_after": retrieved_pages_after,
-        "generated_answer": answer,
-        "metrics": metrics,
-        "timings": step_times,
-    }
-
-
-def summarize_eval_results(results: list[dict]) -> dict:
-    """Aggregate retrieval and generation quality metrics."""
-    if not results:
-        return {}
-
-    count = len(results)
-    metric_keys = [
-        "hit_at_k_before",
-        "hit_at_n_after",
-        "reciprocal_rank",
-        "token_f1",
-        "citation_ok",
-        "grounded_bigram_recall",
-    ]
-
-    aggregates = {}
-    for key in metric_keys:
-        aggregates[key] = float(np.mean([r["metrics"][key] for r in results]))
-
-    reranker_lift = aggregates["hit_at_n_after"] - aggregates["hit_at_k_before"]
-    avg_total_latency = float(
-        np.mean(
-            [
-                sum(r["timings"].values())
-                for r in results
-            ]
-        )
-    )
-
-    failures = sorted(
-        results,
-        key=lambda r: (
-            r["metrics"]["hit_at_n_after"],
-            r["metrics"]["token_f1"],
-            r["metrics"]["grounded_bigram_recall"],
-        ),
-    )[:EVAL_MAX_FAILURE_EXAMPLES]
-
-    return {
-        "num_samples": count,
-        "aggregates": aggregates,
-        "reranker_lift": reranker_lift,
-        "avg_total_latency_s": avg_total_latency,
-        "failure_examples": [
-            {
-                "sample_id": f["sample_id"],
-                "question": f["question"],
-                "source_page": f["source_page"],
-                "retrieved_pages_after": f["retrieved_pages_after"],
-                "token_f1": f["metrics"]["token_f1"],
-                "grounded_bigram_recall": f["metrics"]["grounded_bigram_recall"],
-            }
-            for f in failures
-        ],
-    }
-
-
-def run_evaluation(pdf_path: str, eval_size: int = EVAL_DATASET_SIZE, top_k: int = SEARCH_TOP_K) -> dict:
-    """Offline evaluation pipeline using synthetic Q/A data."""
-    timings = {}
-
-    with Timer("Eval: Parse + Embed (cached)") as t:
-        processed_chunks = load_or_process(pdf_path)
-    timings["load_or_process_s"] = t.elapsed
-
-    with Timer("Eval: Weaviate Upload") as t:
-        upload_to_weaviate(processed_chunks)
-    timings["upload_s"] = t.elapsed
-
-    with Timer("Eval: Synthetic Dataset") as t:
-        current_hash = file_hash(pdf_path)
-        samples = build_synthetic_dataset(processed_chunks, current_hash, dataset_size=eval_size)
-    timings["synthetic_dataset_s"] = t.elapsed
-
-    per_sample_results = []
-    for i, sample in enumerate(samples, start=1):
-        print(f"\n=== Evaluating sample {i}/{len(samples)} ===")
-        per_sample_results.append(evaluate_one_sample(sample, top_k=top_k))
-
-    metrics_summary = summarize_eval_results(per_sample_results)
-    payload = {
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "file_path": pdf_path,
-        "eval_size": len(samples),
-        "top_k": top_k,
-        "pipeline_timings": timings,
-        "metrics_summary": metrics_summary,
-        "per_sample_results": per_sample_results,
-    }
-    save_json(EVAL_RESULTS_PATH, payload)
-    print(f"\nSaved evaluation results to {EVAL_RESULTS_PATH}")
-    return payload
-
-
-def print_eval_summary(payload: dict):
-    summary = payload.get("metrics_summary", {})
-    if not summary:
-        print("\nNo evaluation summary available.")
-        return
-    agg = summary["aggregates"]
-    print("\n" + "=" * 60)
-    print("EVALUATION SUMMARY")
-    print("=" * 60)
-    print(f"Samples: {summary['num_samples']}")
-    print(f"Hit@K (before rerank): {agg['hit_at_k_before']:.3f}")
-    print(f"Hit@N (after rerank):  {agg['hit_at_n_after']:.3f}")
-    print(f"MRR:                  {agg['reciprocal_rank']:.3f}")
-    print(f"Token F1:             {agg['token_f1']:.3f}")
-    print(f"Citation compliance:  {agg['citation_ok']:.3f}")
-    print(f"Groundedness proxy:   {agg['grounded_bigram_recall']:.3f}")
-    print(f"Reranker lift:        {summary['reranker_lift']:.3f}")
-    print(f"Avg total latency:    {summary['avg_total_latency_s']:.2f}s")
-    print("-" * 60)
-    print("Top failure examples:")
-    for failure in summary["failure_examples"]:
-        print(
-            f"  - {failure['sample_id']} | page={failure['source_page']} | "
-            f"token_f1={failure['token_f1']:.3f} | grounded={failure['grounded_bigram_recall']:.3f}"
-        )
-    print("=" * 60)
-
-
-
 # MAIN PIPELINE
 def main():
     global SEARCH_TOP_K
-    mode = (input("Choose mode [run/eval] (default=run): ") or "run").strip().lower()
     SEARCH_TOP_K = int(input("How many chunks to retrieve? [default=30]: ") or 30)
 
-    if mode == "eval":
-        eval_size = int(input(f"How many synthetic eval samples? [default={EVAL_DATASET_SIZE}]: ") or EVAL_DATASET_SIZE)
-        eval_payload = run_evaluation(FILE_PATH, eval_size=eval_size, top_k=SEARCH_TOP_K)
-        print_eval_summary(eval_payload)
-        return
 
     timings = {}
     total_start = time.perf_counter()

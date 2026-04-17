@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Document Assistant</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar bg-slate" id="sidebar">
+            <div class="sidebar-header">
+                <h2>Assistant</h2>
+                <button id="toggle-sidebar" class="icon-btn"><i class="fas fa-bars"></i></button>
+            </div>
+            
+            <div class="sidebar-content">
+                <div class="upload-section">
+                    <label for="pdf-upload" class="upload-btn">
+                        <i class="fas fa-file-pdf"></i> Upload Survey PDF
+                    </label>
+                    <input type="file" id="pdf-upload" accept="application/pdf" hidden>
+                    <div id="upload-status" class="status-msg hidden"></div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Chat Area -->
+        <main class="chat-container">
+            <header class="mobile-header">
+                <button id="mobile-toggle" class="icon-btn"><i class="fas fa-bars"></i></button>
+                <h2>DeepSeek Document RAG</h2>
+            </header>
+
+            <div class="chat-history" id="chat-history">
+                <div class="message assistant-message welcome-message">
+                    <div class="avatar"><i class="fas fa-robot"></i></div>
+                    <div class="message-content">
+                        Hello. I've analyzed your survey document. Ask me anything about its contents.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Input Area -->
+            <div class="input-container">
+                <div class="input-wrapper">
+                    <textarea id="chat-input" placeholder="Message Assistant..." rows="1"></textarea>
+                    <button id="send-btn" class="send-btn" disabled>
+                        <i class="fas fa-arrow-up"></i>
+                    </button>
+                </div>
+                <div class="disclaimer">
+                    AI can make mistakes. Always check the cited page numbers.
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

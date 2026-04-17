@@ -17,14 +17,14 @@ from rag_optimized import (
 )
 
 from ragas import SingleTurnSample, EvaluationDataset, evaluate
-from ragas.metrics.collections import (
-    Faithfulness,
-    AnswerRelevancy,
-    ContextPrecisionWithoutReference,
-    ContextRecall
+from ragas.metrics import (
+    faithfulness,
+    answer_relevancy,
+    context_precision,
+    context_recall
 )
 from ragas.llms import llm_factory
-from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
+from langchain_ollama import OllamaEmbeddings
 
 def main():
     print("=" * 60)
@@ -38,8 +38,11 @@ def main():
     )
     
     # 2. Setup RAGAS evaluators with local models
-    evaluator_llm = llm_factory("mistral", client=client)
-    evaluator_embeddings = RagasOpenAIEmbeddings(model="nomic-embed-text", client=client)
+    # We use LangchainLLMWrapper with ChatOllama to force num_predict=-1, avoiding instructor truncation limits.
+    from langchain_ollama import ChatOllama
+    from ragas.llms import LangchainLLMWrapper
+    evaluator_llm = LangchainLLMWrapper(ChatOllama(model="mistral", temperature=0.0, num_predict=-1))
+    evaluator_embeddings = OllamaEmbeddings(model="nomic-embed-text")
     
     print("\n" + "=" * 60)
     print("SYNC: Validating Vector Database State")
@@ -79,7 +82,7 @@ def main():
         # because these outputs can clutter tqdm format
         top_chunks = rerank_chunks(query, retrieved_chunks, top_n=5)
         
-        retrieved_contexts = [chunk["content"] for chunk in top_chunks]
+        retrieved_contexts = [f"PAGE {chunk['page']}: {chunk['content']}" for chunk in top_chunks]
         
         prompt = build_prompt(query, top_chunks)
         answer = generate_answer(prompt)
@@ -99,11 +102,19 @@ def main():
     print("EVAL: Executing RAGAS Metrics")
     print("=" * 60)
     
+    # Explicitly attach the llm and embeddings to the backward-compatible objects
+    # to avoid the internal wrapper bug in ragas.evaluate() that strips out embed_query
+    faithfulness.llm = evaluator_llm
+    answer_relevancy.llm = evaluator_llm
+    answer_relevancy.embeddings = evaluator_embeddings
+    context_precision.llm = evaluator_llm
+    context_recall.llm = evaluator_llm
+    
     metrics = [
-        Faithfulness(llm=evaluator_llm),
-        AnswerRelevancy(llm=evaluator_llm, embeddings=evaluator_embeddings),
-        ContextPrecisionWithoutReference(llm=evaluator_llm),
-        ContextRecall(llm=evaluator_llm)
+        faithfulness,
+        answer_relevancy,
+        context_precision,
+        context_recall
     ]
     
     try:
