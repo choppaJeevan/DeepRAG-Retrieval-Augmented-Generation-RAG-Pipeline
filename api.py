@@ -1,6 +1,10 @@
 import os
 import json
 import asyncio
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,6 +18,7 @@ from rag_optimized import (
     upload_to_weaviate,
     FILE_PATH,
     embed_query,
+    rewrite_query,
     weaviate_search,
     rerank_chunks,
     build_prompt,
@@ -23,7 +28,40 @@ from rag_optimized import (
     LLM_TEMPERATURE
 )
 
-app = FastAPI(title="RAG AI Research Assistant")
+@asynccontextmanager
+async def lifespan(app):
+    import subprocess, time
+    # Start ngrok tunnel on app startup
+    ngrok_tunnel = None
+    token = os.environ.get("NGROK_AUTHTOKEN", "")
+    if token:
+        from pyngrok import ngrok
+        # Force kill any stale ngrok processes via OS command
+        subprocess.run("taskkill /F /IM ngrok.exe", shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)  # Wait for OS to fully release the process
+        ngrok.set_auth_token(token)
+        try:
+            ngrok_tunnel = ngrok.connect(8000)
+            print(f"\n{'='*60}")
+            print(f"  PUBLIC URL (share this!): {ngrok_tunnel.public_url}")
+            print(f"  Local URL: http://localhost:8000")
+            print(f"{'='*60}\n")
+        except Exception as e:
+            print(f"\nngrok tunnel failed: {e}")
+            print("Continuing with local-only mode.\n")
+    else:
+        print("\nNo NGROK_AUTHTOKEN found - running local only.\n")
+    yield
+    # Shutdown: cleanly disconnect ngrok
+    if ngrok_tunnel:
+        from pyngrok import ngrok
+        try:
+            ngrok.kill()
+        except Exception:
+            pass
+
+app = FastAPI(title="RAG AI Research Assistant", lifespan=lifespan)
 
 # Add CORS middleware to allow cross-origin requests
 app.add_middleware(
@@ -77,8 +115,9 @@ async def upload_pdf(file: UploadFile = File(...)):
 async def chat_stream(req: ChatRequest):
     async def event_stream():
         try:
-            # 1. Pipeline execution synchronously (weaviate + rerank)
-            query_vector = embed_query(req.query)
+            # 1. Rewrite query for better retrieval, keep original for reranking/prompt
+            rewritten = await asyncio.to_thread(rewrite_query, req.query)
+            query_vector = embed_query(rewritten)
             retrieved_chunks = weaviate_search(query_vector, top_k=30)
             top_chunks = rerank_chunks(req.query, retrieved_chunks, top_n=5)
             
@@ -126,4 +165,5 @@ async def chat_stream(req: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("api:app", host="0.0.0.0", port=8000)
+
