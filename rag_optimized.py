@@ -21,20 +21,20 @@ from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
 load_dotenv()
 
-FILE_PATH = "./NLP_project/file_survey_paper.pdf"
+FILE_PATH = "./file_survey_paper.pdf"
 CACHE_DIR = "./rag_cache"
 COLLECTION_NAME = "LlamaParse_MRL_nomic"
-TARGET_DIM = 256
+TARGET_DIM = 384
 EMBED_MODEL_NAME = "nomic-embed-text"
 GENERATION_MODEL = "deepseek-r1:8b"
-RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # Retrieval settings
 SEARCH_TOP_K = 20              # Default; overridden in main() via input
-RERANK_TOP_N = 3               # Keep only top 3 to prevent context explosion WITHOUT truncating
+RERANK_TOP_N = 5               # Keep top 5 for richer context (fits in 8192 context window)
 
 # Generation settings
-LLM_NUM_CTX = 4096         # Context window size
+LLM_NUM_CTX = 8192         # Context window size (DeepSeek-R1 supports up to 32K)
 LLM_NUM_PREDICT = 1024     # Max output tokens
 LLM_TEMPERATURE = 0.0      # Zero temperature to force deterministic, faithful extraction
 
@@ -76,6 +76,7 @@ def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
     parser = LlamaParse(
         api_key=api_key,
         result_type="markdown",
+        split_by_page=True,   # Force one document per PDF page for accurate page numbers
         num_workers=4,        # Increase parallelism for large docs
         verbose=True,
         language="en",
@@ -86,8 +87,7 @@ def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
     print(f"Parsed {len(documents)} document sections.")
 
     # Convert LlamaIndex → LangChain documents with metadata
-    # NOTE: LlamaParse returns empty metadata (no page_label).
-    # Since it returns ~1 section per page, we use the index as page number.
+    # split_by_page=True ensures each document maps to a real PDF page.
     lc_docs = []
     for idx, doc in enumerate(documents):
         page_num = doc.metadata.get("page_label", str(idx + 1))
@@ -243,7 +243,34 @@ def upload_to_weaviate(processed_chunks: list[dict]):
         client.close()
 
 
-# STEP 3: QUERY EMBEDDING
+# STEP 3: QUERY REWRITING
+def rewrite_query(original_query: str) -> str:
+    """Rewrite vague queries into specific, search-optimized versions."""
+    llm = OllamaLLM(
+        model=GENERATION_MODEL,
+        temperature=0.0,
+        num_predict=150,
+        num_ctx=512,
+    )
+    prompt = (
+        "You are a search query optimizer. Rewrite the user's question to be "
+        "more specific and detailed for searching a research paper. "
+        "Output ONLY the rewritten question — no explanation, no preamble.\n\n"
+        f"Original: {original_query}\n"
+        "Rewritten:"
+    )
+    rewritten = llm.invoke(prompt).strip()
+    # Strip <think>...</think> tags from DeepSeek-R1
+    rewritten = re.sub(r"<think>.*?</think>", "", rewritten, flags=re.DOTALL).strip()
+    # Fallback: if rewriting produced garbage or empty, use original
+    if not rewritten or len(rewritten) < 5:
+        return original_query
+    print(f"  Original query:  {original_query}")
+    print(f"  Rewritten query: {rewritten}")
+    return rewritten
+
+
+# STEP 4: QUERY EMBEDDING
 def embed_query(query_text: str) -> list[float]:
     """Embed a user query, apply MRL slicing + normalization."""
     embed_model = OllamaEmbeddings(model=EMBED_MODEL_NAME)
@@ -258,7 +285,7 @@ def embed_query(query_text: str) -> list[float]:
     return sliced.tolist()
 
 
-# STEP 4: WEAVIATE VECTOR SEARCH
+# STEP 5: WEAVIATE VECTOR SEARCH
 def weaviate_search(query_vec: list[float], top_k: int = SEARCH_TOP_K) -> list[dict]:
     """
     Search Weaviate using near_vector with pre-computed MRL vectors.
@@ -290,7 +317,7 @@ def weaviate_search(query_vec: list[float], top_k: int = SEARCH_TOP_K) -> list[d
         client.close()
 
 
-# STEP 5: CROSS-ENCODER RE-RANKING (no LLM distillation!)
+# STEP 6: CROSS-ENCODER RE-RANKING 
 def rerank_chunks(query: str, chunks: list[dict], top_n: int = RERANK_TOP_N) -> list[dict]:
     """
     Re-rank retrieved chunks using a cross-encoder.
@@ -318,23 +345,20 @@ def rerank_chunks(query: str, chunks: list[dict], top_n: int = RERANK_TOP_N) -> 
     return ranked[:top_n]
 
 
-# STEP 6: PROMPT SYNTHESIS
+# STEP 7: PROMPT SYNTHESIS
 def build_prompt(query: str, top_chunks: list[dict]) -> str:
     system_rules = (
-        "You are an exact, fact-based research assistant.\n"
-        "Your CORE MISSION is to answer using ONLY the explicit facts from the context below.\n"
-        "If the context does not explicitly state the answer, you MUST say 'I cannot answer this based on the provided text'.\n"
-        "CONSTRAINTS:\n"
-        "- NO HALLUCINATION: Do not inject outside knowledge or guess.\n"
-        "- NO RAMBLING: Do not write paragraphs if a single sentence answers the question.\n"
-        "- CITE RELIABLY: Always append [Page X] to the end of a sentence if you used a fact from that page.\n"
-        "- DO NOT paraphrase back the question.\n"
-        "- DO NOT write disclaimers."
+        "You are a precise research assistant. Answer using ONLY facts from the context below.\n"
+        "Rules:\n"
+        "1. Use ONLY information explicitly stated in the context. Never add outside knowledge.\n"
+        "2. Cite sources inline as [Page X] after each fact you reference.\n"
+        "3. Be concise — answer directly without restating the question or adding disclaimers.\n"
+        "4. If the context does not contain the answer, say: 'The provided text does not cover this.'\n"
+        "5. Write naturally — do not use rigid templates or repeat yourself."
     )
 
     context_block = ""
     for i, chunk in enumerate(top_chunks):
-        # We now pass the entire unbroken chunk safely since we reduced top_n to 3
         content = chunk["content"]
         context_block += f"\n--- CHUNK {i+1} (PAGE {chunk['page']}) ---\n{content}\n"
 
@@ -352,7 +376,7 @@ GROUNDED ANSWER:"""
 
 
 
-# STEP 7: LLM GENERATION
+# STEP 8: LLM GENERATION
 def generate_answer(prompt: str) -> str:
     """Generate a grounded answer using DeepSeek-R1:8b with capped parameters."""
     llm = OllamaLLM(
@@ -396,32 +420,37 @@ def main():
         upload_to_weaviate(processed_chunks)
     timings["2. Weaviate Upload"] = t.elapsed
 
-    # ── Step 3: User Query + Embedding ──
+    # ── Step 3: User Query + Rewriting ──
     query_text = input("\nEnter your question: ")
 
-    with Timer("Query Embedding") as t:
-        query_vector = embed_query(query_text)
-    timings["3. Query Embed"] = t.elapsed
+    with Timer("Query Rewriting") as t:
+        rewritten_query = rewrite_query(query_text)
+    timings["3. Query Rewrite"] = t.elapsed
 
-    # ── Step 4: Weaviate Search ──
+    # ── Step 4: Query Embedding ──
+    with Timer("Query Embedding") as t:
+        query_vector = embed_query(rewritten_query)
+    timings["4. Query Embed"] = t.elapsed
+
+    # ── Step 5: Weaviate Search ──
     with Timer("Weaviate Search") as t:
         retrieved_chunks = weaviate_search(query_vector, top_k=SEARCH_TOP_K)
-    timings["4. Weaviate Search"] = t.elapsed
+    timings["5. Weaviate Search"] = t.elapsed
 
-    # ── Step 5: Re-rank ──
+    # ── Step 6: Re-rank (uses ORIGINAL query for relevance scoring) ──
     with Timer("Cross-Encoder Re-ranking") as t:
         top_chunks = rerank_chunks(query_text, retrieved_chunks, top_n=RERANK_TOP_N)
-    timings["5. Re-ranking"] = t.elapsed
+    timings["6. Re-ranking"] = t.elapsed
 
-    # ── Step 6: Prompt Synthesis ──
+    # ── Step 7: Prompt Synthesis ──
     with Timer("Prompt Synthesis") as t:
         final_prompt = build_prompt(query_text, top_chunks)
-    timings["6. Prompt Synthesis"] = t.elapsed
+    timings["7. Prompt Synthesis"] = t.elapsed
 
-    # ── Step 7: LLM Generation ──
+    # ── Step 8: LLM Generation ──
     with Timer(f"LLM Generation ({GENERATION_MODEL})") as t:
         answer = generate_answer(final_prompt)
-    timings["7. LLM Generation"] = t.elapsed
+    timings["8. LLM Generation"] = t.elapsed
 
     # ── Output ──
     total_elapsed = time.perf_counter() - total_start
