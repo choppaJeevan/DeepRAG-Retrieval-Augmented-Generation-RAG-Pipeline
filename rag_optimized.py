@@ -64,8 +64,15 @@ def file_hash(path: str) -> str:
 
 def get_cache_path(pdf_path: str) -> str:
     """Return cache file path based on the PDF filename."""
+    # Ensures the target directory exists. If it doesn't, create it.
+    # 'exist_ok=True' prevents an error if the directory is already there.
     os.makedirs(CACHE_DIR, exist_ok=True)
+    # 1. os.path.basename: Strips directory info (e.g., "/home/user/doc.pdf" -> "doc.pdf")
+    # 2. os.path.splitext: Splits filename and extension (e.g., "doc.pdf" -> ("doc", ".pdf"))
+    # 3. [0]: Accesses just the name part ("doc") to avoid naming issues.
     base = os.path.splitext(os.path.basename(pdf_path))[0]
+    # Construct the final path using os.path.join for cross-platform compatibility 
+    # (handles different path separators like / or \ automatically).
     return os.path.join(CACHE_DIR, f"{base}_cache.json")
 
 
@@ -75,18 +82,18 @@ def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
     api_key = os.getenv("LLAMA_CLOUD_API_KEY")
     parser = LlamaParse(
         api_key=api_key,
-        result_type="markdown",
+        result_type="markdown",# You can either use "text" or "Markdown". Markdown is better when you are trying to read the table and images
         split_by_page=True,   # Force one document per PDF page for accurate page numbers
         num_workers=4,        # Increase parallelism for large docs
-        verbose=True,
+        verbose=True,         # processing chain of thought of parsing
         language="en",
     )
 
     print(f"Parsing: {pdf_path}")
     documents = parser.load_data(pdf_path)
     print(f"Parsed {len(documents)} document sections.")
-
-    # Convert LlamaIndex → LangChain documents with metadata
+    # Translate LlamaIndex internal documents into LangChain Document objects 
+    # while preserving file and page metadata for downstream traceability.
     # split_by_page=True ensures each document maps to a real PDF page.
     lc_docs = []
     for idx, doc in enumerate(documents):
@@ -100,15 +107,16 @@ def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
                 },
             )
         )
-
-    # Pre-split to stay within embedding model token limits
+    # Perform a 'hard' pre-split to ensure chunks fit within embedding model context limits
+    # and to reduce the workload for the computationally expensive semantic splitter.
     pre_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,
         chunk_overlap=150,
     )
     pre_split_docs = pre_splitter.split_documents(lc_docs)
     print(f"Pre-split into {len(pre_split_docs)} chunks.")
-
+    # Use embeddings to identify semantic breaks (e.g., changes in topic),
+    # ensuring that related information is kept together rather than split arbitrarily.
     # Semantic chunking
     embed_model = OllamaEmbeddings(model=EMBED_MODEL_NAME)
     semantic_chunker = SemanticChunker(
