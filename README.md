@@ -83,3 +83,37 @@ It then runs the `evaluate()` function asynchronously across the generated datas
 
 ### Step 6: Results Export
 Aggregates the evaluation scores and converts the detailed, row-by-row results into a Pandas DataFrame. It exports this data to a new file named `eval_results.json` in the current directory, allowing you to easily review the system's performance and identify areas for improvement.
+
+## FastAPI Backend & Streaming API
+
+### Imports & Application Setup
+Loads environment variables and imports necessary tools from FastAPI (for routing and API creation), Pydantic (for data validation), and the core functions from your underlying `rag_optimized.py` pipeline. It initializes the FastAPI application and mounts a frontend directory so the API can serve your HTML/CSS/JS files directly.
+
+### Cross-Origin Resource Sharing (CORS) Middleware
+Configures the server to accept requests from any origin (`allow_origins=["*"]`). This is crucial for local development, allowing your frontend UI to communicate with the backend API without hitting browser security blocks.
+
+### Server Lifespan & Ngrok Tunneling (`lifespan`)
+Manages startup and shutdown events for the server.
+- **Startup**: It checks your `.env` file for an `NGROK_AUTHTOKEN`. If found, it safely kills any lingering ngrok background processes and opens a secure tunnel to port 8000. This generates a Public URL, allowing you to easily share your locally hosted AI app with others over the internet.
+- **Shutdown**: It cleanly closes the ngrok tunnel when you stop the FastAPI server.
+
+### UI Entrypoint (`GET /`)
+A simple route that serves the `index.html` file from your frontend directory when a user visits the root URL (e.g., `http://localhost:8000`).
+
+### Document Upload & Processing Endpoint (`POST /api/upload`)
+Handles incoming PDF uploads from the user interface.
+- **Temporary Storage**: Saves the uploaded file to a local `NLP_project/temp_upload.pdf` path.
+- **Background Processing**: Uses `asyncio.to_thread` to run your heavy parsing, chunking, and Weaviate upload functions (`load_or_process` and `upload_to_weaviate`) without freezing the main server thread.
+- **Server-Sent Events (SSE)**: Yields real-time status updates back to the frontend (e.g., "Parsing PDF...", "Vectorizing..."). This allows the UI to show a live progress bar while the document processes.
+- **Cleanup**: Automatically deletes the temporary PDF file once processing is complete or if an error occurs.
+
+### Chat & Streaming Endpoint (`POST /api/chat`)
+The core conversational engine of the app. It accepts a user query and executes the full RAG pipeline while streaming results in real-time using Server-Sent Events (SSE).
+- **Retrieval**: Rewrites the query, embeds it, searches Weaviate, and re-ranks the top chunks.
+- **Source Emitting**: Instantly sends a custom `sources` event to the frontend containing the page numbers and text snippets of the retrieved chunks so the user can see where the AI is looking.
+- **Response Streaming**: Synthesizes the prompt and begins streaming the LLM's response token-by-token.
+- **Reasoning Parsing**: Contains specialized logic to detect DeepSeek-R1's internal `<think>` tags. It separates the model's "internal thought process" from its "final text answer" and streams them as distinct JSON objects (`{"think": chunk}` vs `{"text": chunk}`). This allows the frontend to beautifully render the AI's reasoning in a collapsible UI box before showing the final answer.
+
+### Application Runner (`__main__`)
+Uses Uvicorn, a lightning-fast ASGI server, to run the FastAPI application on host `0.0.0.0` (accessible on your local network) at port `8000`.
+
