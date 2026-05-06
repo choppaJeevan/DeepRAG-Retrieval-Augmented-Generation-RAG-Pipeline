@@ -7,11 +7,11 @@ __pycache__/
 # Ignore text files EXCEPT the important ones
 *.txt
 !requirements.txt
-!SETUP_INSTRUCTIONS.txt
+#!SETUP_INSTRUCTIONS.txt
 
 # Ignore json and pdf data files
 *.json
 *.pdf
-
+!file_survey_paper.pdf
 # Ignore Jupyter notebooks
 *.ipynb
