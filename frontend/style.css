@@ -269,7 +269,160 @@ body {
     word-wrap: break-word;
 }
 
-/* Thought Process Accordion */
+/* Pipeline Tracker — Real-time RAG pipeline status */
+.pipeline-slot {
+    min-height: 0;
+}
+
+.pipeline-tracker {
+    background: var(--bg-sidebar);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 0.85rem 1rem;
+    margin-bottom: 1rem;
+    animation: fadeIn 0.3s ease-out;
+}
+
+.pipeline-header {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-bottom: 0.6rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.pipeline-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+
+.pipeline-step {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    padding: 0.45rem 0.7rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    animation: slideIn 0.25s ease-out;
+    transition: all 0.3s ease;
+    border-left: 3px solid transparent;
+}
+
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateX(-8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+.pipeline-step.active {
+    background: rgba(139, 92, 246, 0.08);
+    color: var(--accent);
+    border-left-color: var(--accent);
+}
+
+.pipeline-step.done {
+    color: #10b981;
+    opacity: 0.85;
+    border-left-color: #10b981;
+}
+
+.pipeline-step.pending {
+    color: var(--text-muted);
+    opacity: 0.35;
+}
+
+.step-icon {
+    width: 18px;
+    text-align: center;
+    font-size: 0.8rem;
+    flex-shrink: 0;
+}
+
+.step-label {
+    flex: 1;
+    font-weight: 500;
+}
+
+.step-status {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-shrink: 0;
+}
+
+.step-state-icon {
+    font-size: 0.75rem;
+}
+
+.pipeline-step.active .step-state-icon {
+    color: var(--accent);
+}
+
+.pipeline-step.done .step-state-icon {
+    color: #10b981;
+}
+
+.step-time {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Pipeline Summary — Collapsed state after completion */
+.pipeline-summary {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    background-color: var(--bg-sidebar);
+    border-radius: 8px;
+    padding: 0.6rem 0.85rem;
+    margin-bottom: 1rem;
+    border: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.pipeline-summary:hover {
+    border-color: var(--accent);
+}
+
+.pipeline-summary summary {
+    cursor: pointer;
+    font-weight: 500;
+    user-select: none;
+    outline: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+}
+
+.pipeline-summary summary:hover {
+    color: var(--text-primary);
+}
+
+.pipeline-summary[open] summary {
+    margin-bottom: 0.5rem;
+    color: var(--text-primary);
+}
+
+.pipeline-summary .pipeline-steps {
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border-color);
+}
+
+
 .thought-process {
     font-size: 0.85rem;
     color: var(--text-muted);
