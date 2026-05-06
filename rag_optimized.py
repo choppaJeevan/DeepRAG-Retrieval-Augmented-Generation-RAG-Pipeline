@@ -30,7 +30,7 @@ GENERATION_MODEL = "deepseek-r1:8b"
 RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # Retrieval settings
-SEARCH_TOP_K = 20              # Default; overridden in main() via input
+SEARCH_TOP_K = 30              # Default; overridden in main() via input
 RERANK_TOP_N = 5               # Keep top 5 for richer context (fits in 8192 context window)
 
 # Generation settings
@@ -76,9 +76,16 @@ def get_cache_path(pdf_path: str) -> str:
     return os.path.join(CACHE_DIR, f"{base}_cache.json")
 
 
+# Max characters per chunk — safe limit for nomic-embed-text's 8192-token context.
+# ~4 chars/token → 8192 tokens ≈ 32K chars, but we use 7000 chars (~1750 tokens)
+# to leave headroom and produce chunks that fit comfortably in the generation
+# model's context window alongside the prompt and other chunks.
+MAX_CHUNK_CHARS = 7000
+
+
 # STEP 1: PARSE + CHUNK + EMBED (with caching)
 def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
-    """Parse PDF with LlamaParse → pre-split → semantic chunk."""
+    """Parse PDF with LlamaParse → semantic chunk → post-split oversized chunks."""
     api_key = os.getenv("LLAMA_CLOUD_API_KEY")
     parser = LlamaParse(
         api_key=api_key,
@@ -107,27 +114,43 @@ def parse_and_chunk(pdf_path: str) -> list[LC_Document]:
                 },
             )
         )
-    # Perform a 'hard' pre-split to ensure chunks fit within embedding model context limits
-    # and to reduce the workload for the computationally expensive semantic splitter.
-    pre_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=150,
-    )
-    pre_split_docs = pre_splitter.split_documents(lc_docs)
-    print(f"Pre-split into {len(pre_split_docs)} chunks.")
     # Use embeddings to identify semantic breaks (e.g., changes in topic),
     # ensuring that related information is kept together rather than split arbitrarily.
-    # Semantic chunking
     embed_model = OllamaEmbeddings(model=EMBED_MODEL_NAME)
     semantic_chunker = SemanticChunker(
         embed_model,
         breakpoint_threshold_type="percentile",
         breakpoint_threshold_amount=95.0,
+        # Default regex is `(?<=[.?!])\s+`. We add `\n+` to force splitting on newlines,
+        # which prevents crashes on large markdown tables that lack punctuation.
+        sentence_split_regex=r"(?<=[.?!])\s+|\n+"
     )
-    semantic_chunks = semantic_chunker.split_documents(pre_split_docs)
+    semantic_chunks = semantic_chunker.split_documents(lc_docs)
     print(f"Semantic chunking produced {len(semantic_chunks)} chunks.")
 
-    return semantic_chunks
+    # Post-split: only break apart chunks that exceed the embedding model's
+    # context window. This preserves semantic boundaries for normal-sized chunks
+    # while ensuring no chunk overflows during embedding.
+    oversized = sum(1 for c in semantic_chunks if len(c.page_content) > MAX_CHUNK_CHARS)
+    if oversized > 0:
+        print(f"  {oversized} chunk(s) exceed {MAX_CHUNK_CHARS} chars — post-splitting...")
+        post_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=MAX_CHUNK_CHARS,
+            chunk_overlap=200,
+        )
+        final_chunks = []
+        for chunk in semantic_chunks:
+            if len(chunk.page_content) > MAX_CHUNK_CHARS:
+                sub_chunks = post_splitter.split_documents([chunk])
+                final_chunks.extend(sub_chunks)
+            else:
+                final_chunks.append(chunk)
+        print(f"  Post-split: {len(semantic_chunks)} → {len(final_chunks)} chunks.")
+    else:
+        print(f"  All chunks within {MAX_CHUNK_CHARS} char limit — no post-splitting needed.")
+        final_chunks = semantic_chunks
+
+    return final_chunks
 
 
 def batch_embed_and_slice(chunks: list[LC_Document]) -> list[dict]:
@@ -332,13 +355,25 @@ def rerank_chunks(query: str, chunks: list[dict], top_n: int = RERANK_TOP_N) -> 
     This REPLACES the old LLM distillation step (gemma3:4b) entirely.
     Cross-encoders are purpose-built for relevance scoring — faster + better.
     """
-    reranker = CrossEncoder(RERANKER_MODEL)
+    import torch
+
+    # Force CPU to avoid CUDA context conflicts with Ollama holding the GPU
+    device = "cpu"
+    reranker = CrossEncoder(RERANKER_MODEL, device=device)
 
     # Prepare query-document pairs
     pairs = [[query, chunk["content"]] for chunk in chunks]
 
-    # Score all pairs
-    scores = reranker.predict(pairs)
+    # Score all pairs — use batch_size and disable multiprocessing to prevent
+    # thread deadlocks on Windows when called from asyncio.to_thread
+    print(f"  Reranking {len(pairs)} pairs on {device}...")
+    scores = reranker.predict(
+        pairs,
+        batch_size=32,
+        show_progress_bar=False,
+        num_workers=0,           # Disable multiprocessing DataLoader
+    )
+    print(f"  Reranker scoring complete.")
 
     # Attach scores and sort
     for i, score in enumerate(scores):
@@ -346,7 +381,7 @@ def rerank_chunks(query: str, chunks: list[dict], top_n: int = RERANK_TOP_N) -> 
 
     ranked = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
 
-    print(f"Re-ranked {len(chunks)} → keeping top {top_n}")
+    print(f"Re-ranked {len(chunks)} -> keeping top {top_n}")
     for i, c in enumerate(ranked[:top_n]):
         print(f"   Rank {i+1}: Page {c['page']} | Score: {c['rerank_score']:.4f}")
 
