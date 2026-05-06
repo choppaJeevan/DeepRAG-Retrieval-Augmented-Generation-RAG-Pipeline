@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 *.txt
+*.json
+*.pdf
+.dockerignore
+.md
+*.ipynb

@@ -116,4 +116,3 @@ The core conversational engine of the app. It accepts a user query and executes 
 
 ### Application Runner (`__main__`)
 Uses Uvicorn, a lightning-fast ASGI server, to run the FastAPI application on host `0.0.0.0` (accessible on your local network) at port `8000`.
-
