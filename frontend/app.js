@@ -13,10 +13,14 @@ document.addEventListener("DOMContentLoaded", () => {
     marked.setOptions({ breaks: true, gfm: true });
 
     // === PERSISTENCE LOGIC ===
+    // Using sessionStorage instead of localStorage:
+    // - Data is per-tab and automatically cleared when the tab/browser is closed
+    // - Reopening the page starts a completely fresh session
     const saveChat = () => {
-        // Do not save the typing indicator
-        const htmlToSave = chatHistory.innerHTML.replace(/<div class="typing-indicator">.*?<\/div>/g, '');
-        localStorage.setItem("ragChatHistory", htmlToSave);
+        // Do not save the typing indicator or active pipeline trackers
+        let htmlToSave = chatHistory.innerHTML;
+        htmlToSave = htmlToSave.replace(/<div class="typing-indicator">.*?<\/div>/g, '');
+        sessionStorage.setItem("ragChatHistory", htmlToSave);
     };
 
     // Define the new, generic welcome message
@@ -29,7 +33,7 @@ document.addEventListener("DOMContentLoaded", () => {
         </div>`;
 
     const loadChat = () => {
-        const savedHTML = localStorage.getItem("ragChatHistory");
+        const savedHTML = sessionStorage.getItem("ragChatHistory");
         if (savedHTML && savedHTML.trim() !== "") {
             chatHistory.innerHTML = savedHTML;
             scrollToBottom();
@@ -38,14 +42,24 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     };
 
-    // Load history on startup
+    // One-time cleanup: remove old localStorage data from previous versions
+    localStorage.removeItem("ragChatHistory");
+
+    // Load history on startup (now uses sessionStorage — fresh per tab)
     loadChat();
 
-    // New Chat Button - Clear state and reload for clean reset
-    newChatBtn.addEventListener("click", () => {
-        localStorage.removeItem("ragChatHistory");
-        window.location.reload();
+    // New Chat Button - Clear both client-side and server-side state
+    newChatBtn.addEventListener("click", async () => {
+        sessionStorage.removeItem("ragChatHistory");
+        chatHistory.innerHTML = welcomeMessageHTML;
+        // Also clear server-side Weaviate data
+        try {
+            await fetch("/api/reset", { method: "POST" });
+        } catch (e) {
+            console.warn("Could not reset server session:", e);
+        }
     });
+
     // Toggle Sidebar
     toggleSidebarBtn.addEventListener("click", () => {
         sidebar.classList.toggle("collapsed");
@@ -74,6 +88,80 @@ document.addEventListener("DOMContentLoaded", () => {
         chatHistory.scrollTo({ top: chatHistory.scrollHeight, behavior: "smooth" });
     };
 
+    // ── Pipeline Tracker ──────────────────────────────────────────────────
+    const STEP_ICONS = {
+        1: "fa-magnifying-glass",   // Embedding
+        2: "fa-database",           // Searching
+        3: "fa-ranking-star",       // Re-ranking
+        4: "fa-robot",              // Generating
+    };
+
+    const createPipelineTracker = () => {
+        const tracker = document.createElement("div");
+        tracker.className = "pipeline-tracker";
+        tracker.innerHTML = `
+            <div class="pipeline-header">
+                <i class="fas fa-cogs"></i>
+                <span>Processing Pipeline</span>
+            </div>
+            <div class="pipeline-steps"></div>
+        `;
+        return tracker;
+    };
+
+    const updatePipelineStep = (tracker, data) => {
+        const stepsContainer = tracker.querySelector(".pipeline-steps");
+        const stepId = `step-${data.step}`;
+        let stepEl = stepsContainer.querySelector(`#${stepId}`);
+
+        if (!stepEl) {
+            stepEl = document.createElement("div");
+            stepEl.id = stepId;
+            stepEl.className = "pipeline-step pending";
+            stepsContainer.appendChild(stepEl);
+        }
+
+        const iconClass = STEP_ICONS[data.step] || "fa-cog";
+        const stateIcon = data.state === "active"
+            ? '<i class="fas fa-spinner fa-spin step-state-icon"></i>'
+            : data.state === "done"
+                ? '<i class="fas fa-check step-state-icon"></i>'
+                : '<i class="fas fa-circle step-state-icon"></i>';
+
+        const timeStr = data.time ? `<span class="step-time">${data.time}</span>` : '';
+
+        stepEl.className = `pipeline-step ${data.state}`;
+        stepEl.innerHTML = `
+            <span class="step-icon"><i class="fas ${iconClass}"></i></span>
+            <span class="step-label">${data.label}</span>
+            <span class="step-status">${stateIcon}${timeStr}</span>
+        `;
+    };
+
+    const collapsePipelineTracker = (tracker) => {
+        // Convert the tracker into a compact <details> element after completion
+        const steps = tracker.querySelectorAll(".pipeline-step");
+        let summaryParts = [];
+        steps.forEach(s => {
+            const time = s.querySelector(".step-time");
+            if (time) summaryParts.push(time.textContent);
+        });
+
+        const details = document.createElement("details");
+        details.className = "pipeline-summary";
+        const summary = document.createElement("summary");
+        summary.innerHTML = `<i class="fas fa-cogs"></i> Pipeline completed (${summaryParts.join(" + ")})`;
+        details.appendChild(summary);
+
+        // Move steps into details
+        const stepsClone = tracker.querySelector(".pipeline-steps").cloneNode(true);
+        details.appendChild(stepsClone);
+
+        tracker.replaceWith(details);
+        return details;
+    };
+
+    // ── Message Element Creation ──────────────────────────────────────────
     const createMessageElement = (role, content = "") => {
         const msgDiv = document.createElement("div");
         msgDiv.className = `message ${role === 'user' ? 'user-message' : 'assistant-message'}`;
@@ -84,6 +172,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const contentContainer = document.createElement("div");
         contentContainer.className = "message-container";
+
+        // Pipeline tracker (only for assistant messages, populated later)
+        const pipelineSlot = document.createElement("div");
+        pipelineSlot.className = "pipeline-slot";
 
         const thinkDiv = document.createElement("details");
         thinkDiv.className = "thought-process hidden";
@@ -98,16 +190,17 @@ document.addEventListener("DOMContentLoaded", () => {
         contentDiv.className = "message-content";
         contentDiv.innerHTML = content;
 
+        contentContainer.appendChild(pipelineSlot);
         contentContainer.appendChild(thinkDiv);
         contentContainer.appendChild(contentDiv);
 
         msgDiv.appendChild(avatar);
         msgDiv.appendChild(contentContainer);
 
-        return { msgDiv, contentDiv, thinkContent, thinkDiv };
+        return { msgDiv, contentDiv, thinkContent, thinkDiv, pipelineSlot };
     };
 
-    // PDF Upload handling
+    // ── PDF Upload handling ───────────────────────────────────────────────
     pdfUpload.addEventListener("change", async (e) => {
         const file = e.target.files[0];
         if (!file) return;
@@ -153,7 +246,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    // Chat handling
+    // ── Chat handling ─────────────────────────────────────────────────────
     const sendMessage = async () => {
         const query = chatInput.value.trim();
         if (!query) return;
@@ -169,8 +262,20 @@ document.addEventListener("DOMContentLoaded", () => {
         sendBtn.disabled = true;
         scrollToBottom();
 
-        // Create Assistant placeholder
-        const { msgDiv: astMsg, contentDiv: astContent, thinkContent: astThink, thinkDiv: astThinkContainer } = createMessageElement('assistant');
+        // Create Assistant placeholder with pipeline tracker
+        const {
+            msgDiv: astMsg,
+            contentDiv: astContent,
+            thinkContent: astThink,
+            thinkDiv: astThinkContainer,
+            pipelineSlot
+        } = createMessageElement('assistant');
+
+        // Add pipeline tracker
+        const pipelineTracker = createPipelineTracker();
+        pipelineSlot.appendChild(pipelineTracker);
+
+        // Set typing indicator
         astContent.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
         chatHistory.appendChild(astMsg);
         scrollToBottom();
@@ -194,41 +299,87 @@ document.addEventListener("DOMContentLoaded", () => {
                 const { done, value } = await reader.read();
                 if (done) break;
 
-                const chunk = decoder.decode(value, { stream: true });
-                const lines = chunk.split("\n\n");
+                const rawChunk = decoder.decode(value, { stream: true });
+                const blocks = rawChunk.split("\n\n");
 
-                for (const line of lines) {
-                    if (line.startsWith("data: ")) {
-                        const dataStr = line.replace("data: ", "").trim();
+                for (const block of blocks) {
+                    if (!block.trim()) continue;
 
-                        if (dataStr === "[DONE]") {
-                            saveChat(); // Save when stream finishes
-                            break;
+                    // Parse SSE block: extract event type + data
+                    const blockLines = block.split("\n");
+                    let eventType = "";
+                    let dataStr = "";
+
+                    for (const bLine of blockLines) {
+                        if (bLine.startsWith("event: ")) {
+                            eventType = bLine.slice(7).trim();
+                        } else if (bLine.startsWith("data: ")) {
+                            dataStr = bLine.slice(6).trim();
                         }
+                    }
 
+                    // ── Handle status events (pipeline tracker) ──
+                    if (eventType === "status") {
                         try {
-                            const data = JSON.parse(dataStr);
-                            if (data.think) {
-                                if (!clearedLoader) { astContent.innerHTML = ""; clearedLoader = true; }
-                                astThinkContainer.classList.remove("hidden");
-                                thinkAccumulator += data.think;
-                                astThink.innerText = thinkAccumulator;
-                                scrollToBottom();
-                            }
-                            else if (data.text) {
-                                if (!clearedLoader) { astContent.innerHTML = ""; clearedLoader = true; }
-                                markdownAccumulator += data.text;
-                                const renderedHtml = marked.parse(markdownAccumulator);
-                                astContent.innerHTML = formatCitations(renderedHtml);
-                                scrollToBottom();
-                            }
-                            else if (data.error) {
-                                if (!clearedLoader) astContent.innerHTML = "";
-                                astContent.innerHTML += `<p style="color: #ef4444;">Error: ${data.error}</p>`;
-                            }
-                        } catch (e) {
-                            console.error("Error parsing JSON Stream", e);
+                            const statusData = JSON.parse(dataStr);
+                            updatePipelineStep(pipelineTracker, statusData);
+                            scrollToBottom();
+                        } catch (e) { console.error("Status parse error", e); }
+                        continue;
+                    }
+
+                    // ── Handle sources event ──
+                    if (eventType === "sources") {
+                        continue; // Sources are handled implicitly by citations in the response
+                    }
+
+                    // ── Handle error event ──
+                    if (eventType === "error") {
+                        try {
+                            const errData = JSON.parse(dataStr);
+                            if (!clearedLoader) { astContent.innerHTML = ""; clearedLoader = true; }
+                            astContent.innerHTML += `<p style="color: #ef4444;">Error: ${errData.error}</p>`;
+                        } catch (e) {}
+                        continue;
+                    }
+
+                    // ── Handle data events (tokens) ──
+                    if (!dataStr) continue;
+
+                    if (dataStr === "[DONE]") {
+                        // Collapse the pipeline tracker into a compact summary
+                        collapsePipelineTracker(pipelineTracker);
+                        saveChat();
+                        break;
+                    }
+
+                    try {
+                        const data = JSON.parse(dataStr);
+                        if (data.think) {
+                            if (!clearedLoader) { astContent.innerHTML = ""; clearedLoader = true; }
+                            astThinkContainer.classList.remove("hidden");
+                            astThinkContainer.setAttribute("open", "");  // Auto-expand so users see thinking live
+                            thinkAccumulator += data.think;
+                            astThink.innerText = thinkAccumulator;
+                            scrollToBottom();
                         }
+                        else if (data.text) {
+                            if (!clearedLoader) { astContent.innerHTML = ""; clearedLoader = true; }
+                            // Collapse thinking once the real answer starts
+                            if (astThinkContainer.hasAttribute("open")) {
+                                astThinkContainer.removeAttribute("open");
+                            }
+                            markdownAccumulator += data.text;
+                            const renderedHtml = marked.parse(markdownAccumulator);
+                            astContent.innerHTML = formatCitations(renderedHtml);
+                            scrollToBottom();
+                        }
+                        else if (data.error) {
+                            if (!clearedLoader) astContent.innerHTML = "";
+                            astContent.innerHTML += `<p style="color: #ef4444;">Error: ${data.error}</p>`;
+                        }
+                    } catch (e) {
+                        console.error("Error parsing JSON Stream", e);
                     }
                 }
             }
